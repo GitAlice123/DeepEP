@@ -135,6 +135,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
+    # group is list contains all the processes on all nodes
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
@@ -154,6 +155,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
             assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
 
 
+# Every CPU core will run this function with multiple processes
 if __name__ == '__main__':
     # TODO: you may modify NUMA binding for less CPU overhead
     num_processes = 8

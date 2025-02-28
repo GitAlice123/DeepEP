@@ -263,6 +263,7 @@ nvshmemi_ibgda_poll_recv(int dst_pe, int qp_id) {
     *cq->cons_idx = old_cons_idx + 1;
 
     // Wait until `wqe_counter >= old_cons_idx`
+    // 如果CQE还没记录WQE的完成，就轮询等待
     while ((static_cast<uint16_t>(old_cons_idx - HtoBE16(ld_na_relaxed(&cqe64->wqe_counter)) - 1) < ncqes));
 }
 
@@ -336,6 +337,10 @@ ibgda_write_empty_recv_wqe(void *out_wqe) {
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
 }
 
+/**
+ * Allocate receive slots for IBGDA, and ring the doorbell
+ * @param qp The QP to allocate
+ */
 __device__ static __forceinline__ uint64_t
 nvshmemi_ibgda_allocate_recvs(nvshmemi_ibgda_device_qp* qp) {
     auto mvars = &qp->mvars;
@@ -379,6 +384,7 @@ nvshmemi_ibgda_prepare_recvs(int dst_rank, int qp_id) {
 __device__ static __forceinline__ void
 nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx) {
     // Get lkey and rkey, store them into lanes
+    // lkey和rkey是本地和远程的密钥
     uint32_t num_wqes = 0;
     __be32 my_lkey = 0;
     uint64_t my_laddr = 0;
@@ -387,6 +393,7 @@ nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, 
     uint64_t my_chunk_size = 0;
 
     // Decide how many messages (theoretically 3 for maximum)
+    // 每个WQE的大小为chunk_size
     auto remaining_bytes = bytes;
     while (remaining_bytes > 0) {
         if (lane_id == num_wqes)

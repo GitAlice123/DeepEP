@@ -5,9 +5,11 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
-
+# Every CPU on every node will go through this function
+# local_rank: the local rank of the current process on the current node
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
+    # Using IP and port to know who is the master node
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))

@@ -47,14 +47,22 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int phases) {
+    // SM的数量等于块的数量
     const auto sm_id = static_cast<int>(blockIdx.x);
+    // thread_id是在块内（SM内）的索引
     const auto thread_id = static_cast<int>(threadIdx.x);
+    // warp_id是在块内（SM内）的索引
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+    // SM的数量
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+    // 每个rank上的expert数量
     const auto num_local_experts = num_experts / num_ranks;
+    // 该warp所属的warp组
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
+    // 该warp在warp组内的索引
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
+    // 该warp所负责的expert的索引
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
     // FP8 staffs
@@ -74,11 +82,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         goto LOW_LATENCY_DISPATCH_RECV;
 
     // Expert counts
+    // 一个SM里面维护一个这个数组
     __shared__ int shared_num_tokens_sent_per_expert[kNumWarpGroups];
 
     // There are 2 kinds of warps in this part:
-    // 1. The first-kind warps for FP8 cast and sending top-k tokens
-    // 2. The last warp for reading `topk_idx` and count for per-expert information
+    // 1. The first-kind warps for FP8 cast and sending top-k tokens（转换和发送）
+    // 2. The last warp for reading `topk_idx` and count for per-expert information（处理topk_idx路由决策和专家计数）
+    // topk_idx:数组，存储每个 Token 的 Top-K 专家索引
     if (warp_id < num_warps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
@@ -86,16 +96,26 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_threads = (num_warps - 1) * 32;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
+        //线程分配：每个 SM 处理一组 token，步长为 num_sms（SM 总数），实现 ​跨 SM 负载均衡。
+        //​示例：若 num_sms=4，则 SM 0 处理 token 0,4,8,...，SM 1 处理 token 1,5,9,...，依此类推。
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_int2 = reinterpret_cast<int2*>(reinterpret_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
             const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_int2) + kHidden);
             const auto rdma_x_src_idx = reinterpret_cast<int*>(rdma_x_scales + num_scales);
 
+            // num_topk:每个 Token 的 Top-K 专家数量（比如K=3）
+            // dst_expert_idx：当前warp负责的专家索引（只有小于num_topk的warp才会执行发送）
             // Overlap top-k index read and source token index write
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
+            /**
+                ​读取数据：从全局内存加载 bfloat16 数据。
+                ​计算最大值（amax）​：找到数据块内的最大绝对值，用于缩放。
+                ​量化到 FP8：将 bfloat16 转换为 FP8 格式。
+                ​存储结果：将量化后的数据写入 RDMA 缓冲区。
+             */
             // FP8 cast
             #pragma unroll
             for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
@@ -128,13 +148,34 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
 
+            // 下面一个warp里面的所有线程都会执行这个操作
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
+                /*
+                    ​**atomicAdd**：原子操作，为当前专家（dst_expert_idx）分配一个唯一的槽位索引。
+                    ​目的：确保多个线程发送到同一专家时，数据不会覆盖。
+                    ​行为：
+                        只有 lane_id == 0 的线程执行原子操作（避免所有线程争抢）。
+                        其他线程的 slot_idx 初始化为 0（后续通过 __shfl_sync 广播）。
+                        ​示例：若专家 3 的 atomic_counter_per_expert[3] 初始为 0，第一次原子操作后变为 1，返回 0。
+                */
+                // 这个slot，可以实现从源节点发送到目的节点不按序，因为来一个token就给他分配一个slot，往后依次排就行
+                // 目的节点接收的时候按照槽位顺序接收即可，自动实现了按序接收
+                // 所以把对顺序的保证从网络层移到了应用层的内存摆放方式上
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
+                // warp内所有线程广播slot_idx
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
                 const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_int2);
+                /**
+                num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg:
+                    在目标节点里面，在dst_expert_local_idx之前每个专家的缓冲区大小（每个专家都要接收所有节点的所有token）
+                    slot指的是，一个专家为一个节点的一个token分配的缓冲区(留的插槽)
+                前面再乘以dst_expert_local_idx，是为了找到当前专家接收所有节点数据的缓冲区起始位置
+                rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg:找到当前节点的缓冲区起始位置
+                 */
+                // 这个slot_idx
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                                      dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
@@ -150,6 +191,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
                 // Increase counter after finishing
                 __syncwarp();
+                // 本次循环的这个token被发送出去了，所以要增加计数
                 lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
@@ -172,24 +214,32 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
 
         // This SM should be responsible for some destination experts, read `topk_idx` for them
+        // 每个组负责哪个专家（专家号）是确定的，expert_count记录该SM负责的每个专家的token数量
+        // 因为只有每个SM的最后一个warp做计算，相当于每个SM维护一个expert_count数组
         int expert_count[kNumWarpGroups] = {0};
+        // expert_begin_idx~expert_end_idx:当前SM负责的专家范围
         const auto expert_begin_idx = sm_id * kNumWarpGroups;
         const auto expert_end_idx = min(expert_begin_idx + kNumWarpGroups, num_experts);
 
         // Per lane count
+        // 目前expert_count还是每个lane（线程）在各自维护
         #pragma unroll 8
         for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
             auto idx = static_cast<int>(__ldg(topk_idx + i));
-            if (idx >= expert_begin_idx and idx < expert_end_idx)
+            if (idx >= expert_begin_idx and idx < expert_end_idx)// 在本SM负责的范围内
                 expert_count[idx - expert_begin_idx] ++;
         }
 
         // Warp reduce
+        // 把该warp的计数结果累加到lane_id为0的expert_count数组中
         #pragma unroll
         for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
+            // 这个sum是该SM负责的这个专家要接收的token总数
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
             if (lane_id == 0) {
                 shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
+                // atomic_finish_counter_per_expert在后面收到一个就会增加1，最后等于FINISHED_SUM_TAG*2时表示所有token都接收完了
+                // *2是因为在最后结束的时候，要额外增加一个FINISHED_SUM_TAG
                 atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
             }
         }
@@ -218,12 +268,24 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     }
     __syncwarp();
 
+
+
+
+
+
+
+
+
+
+    // -------------------------------------------------------------------------------
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
         return;
 
     // Receiving and packing
+    // 这里的responsible_expert_idx，只用于得到一个src_rank（从这个rank发来的）
+    // 和一个local_expert_idx（发到我当前rank的哪个专家）的二元组，没有特殊含义
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;

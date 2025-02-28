@@ -43,7 +43,7 @@ class Buffer:
             num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
                 to the number of local experts.
         """
-
+        # num_qps_per_rank: 在low-latenct模式下等于每个节点的专家数量
         # TODO: argument docs
         # Initialize the CPP runtime
         self.rank = group.rank()
@@ -75,6 +75,7 @@ class Buffer:
                 os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
                 os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
                 # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
+                # 就是WQ里面可以容纳的还没取出的WQE的数量，开大一点，省的后面再检查
                 os.environ['NVSHMEM_QP_DEPTH'] = '1024'
                 # NOTES: NVSHMEM initialization requires at least 256 MiB
                 os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
