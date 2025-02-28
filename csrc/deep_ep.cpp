@@ -55,6 +55,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         CUDA_CHECK(cudaMemsetAsync(task_fifo_ptrs[nvl_rank], 0, fifo_bytes, comm_stream));
     }
 
+    // 分配在该进程管的GPU的全局显存上，后面执行内核的所有线程都可以访问
+    // 因为是在该进程中执行的，所有只有这个GPU可以访问这个显存
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
@@ -1038,13 +1040,16 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
+    // default stream: 如果我们用CPU线程去添加了一些CUDA任务，不显式指定流的话，那么这些任务会被放到默认流中
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not (async and return_recv_hook));
+    // 这个stream_wait主要是防止各种依赖
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
+    // 也在GPU上
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden}, x.options().dtype(torch::kFloat8_e4m3fn));
     auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));

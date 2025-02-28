@@ -120,6 +120,13 @@ void ibgda_ring_db(nvshmemi_ibgda_device_qp_t *qp, uint16_t prod_idx) {
     st_na_release(bf_ptr, *(reinterpret_cast<uint64_t*>(&ctrl_seg)));
 }
 
+/**
+ * @brief ring the doorbell and update the `prod_idx` of the QP
+ * 
+ * @param qp 
+ * @param new_prod_idx 
+ * @return __device__ 
+ */
 __device__ static __forceinline__
 void ibgda_post_send(nvshmemi_ibgda_device_qp_t *qp, uint64_t new_prod_idx) {
     nvshmemi_ibgda_device_qp_management_t *mvars = &qp->mvars;
@@ -136,6 +143,16 @@ void ibgda_post_send(nvshmemi_ibgda_device_qp_t *qp, uint64_t new_prod_idx) {
     ibgda_lock_release(&mvars->post_send_lock);
 }
 
+/**
+ * @brief 把WQE写到QP中，然后提交请求
+ * 
+ * @tparam kAlwaysDoPostSend 
+ * @param qp 
+ * @param base_wqe_idx 
+ * @param num_wqes 
+ * @param message_idx 
+ * @return __device__ 
+ */
 template <bool kAlwaysDoPostSend>
 __device__ static __forceinline__
 void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx,
@@ -195,12 +212,14 @@ __device__ static __forceinline__
 uint64_t ibgda_get_lkey_and_rkey(uint64_t laddr, __be32 *lkey,
                                  uint64_t raddr, int dst_pe, uint64_t *out_raddr, __be32 *out_rkey) {
     auto state = ibgda_get_state();
+    // 这个heap指的就是前面nvshmem开的那个区域，我们在里面设置了各种buffer指针
     auto heap_start = reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base);
     auto log2_cumem_granularity = state->log2_cumem_granularity;
 
     // Local key
     uint64_t idx = (laddr - heap_start) >> log2_cumem_granularity;
     auto device_key = state->constmem.lkeys[idx];
+    // 计算内存块大小
     auto lchunk_size = device_key.next_addr - laddr;
     *lkey = device_key.key;
 
@@ -286,6 +305,18 @@ nvshmemi_ibgda_rma_p(int *rptr, const int value, int dst_pe, int qp_id, uint32_t
     ibgda_submit_requests<true>(qp, base_wqe_idx, 1);
 }
 
+/**
+ * @brief 生成一个WQE并写到out_wqes中
+ * 
+ * @param qp 
+ * @param laddr = src addr
+ * @param lkey 
+ * @param raddr = dst addr
+ * @param rkey 
+ * @param bytes = chunk size
+ * @param wqe_idx = base_wqe_idx
+ * @param out_wqes 指向要发送的这个WQE的指针
+ */
 __device__ static __forceinline__ void
 ibgda_write_rdma_write_wqe(nvshmemi_ibgda_device_qp_t *qp, uint64_t laddr, __be32 lkey,
                            uint64_t raddr, __be32 rkey, uint32_t bytes, uint16_t wqe_idx,
@@ -381,6 +412,19 @@ nvshmemi_ibgda_prepare_recvs(int dst_rank, int qp_id) {
     EP_DEVICE_ASSERT(nvshmemi_ibgda_allocate_recvs(ibgda_get_rc(dst_rank, qp_id)) > 16);
 }
 
+/**
+ * @brief IBGDA send
+ * 每个warp负责一个[token, dst_expert_idx]对应的消息
+ * 
+ * @param req_rptr = dst_ptr
+ * @param req_lptr = src_ptr
+ * @param bytes = num_bytes_per_msg
+ * @param dst_pe = dst_rank
+ * @param qp_id = dst_expert_local_idx
+ * @param lane_id
+ * @param message_idx = slot_idx
+ * @return __device__ 
+ */
 __device__ static __forceinline__ void
 nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx) {
     // Get lkey and rkey, store them into lanes
@@ -415,6 +459,7 @@ nvshmemi_ibgda_put_nbi_warp(uint64_t req_rptr, uint64_t req_lptr, size_t bytes, 
         base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);
     base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
     if (lane_id < num_wqes) {
+        // 每个线程负责一个WQE
         auto wqe_ptr = ibgda_get_wqe_ptr(qp, base_wqe_idx + lane_id);
         ibgda_write_rdma_write_wqe(qp, my_laddr, my_lkey, my_raddr, my_rkey, my_chunk_size,
                                    base_wqe_idx, &wqe_ptr);

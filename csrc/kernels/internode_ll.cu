@@ -257,6 +257,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank != rank) {
             nvshmemi_ibgda_rma_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1,
                                  dst_rank, dst_expert_local_idx, 0);
+            // 保证接收端有足够的空间接收
             nvshmemi_ibgda_prepare_recvs(dst_rank, dst_expert_local_idx);
         } else {
             st_na_release(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
@@ -350,6 +351,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     }
 }
 
+// 这里还是每个进程都执行
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
