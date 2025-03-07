@@ -22,6 +22,37 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * (rank - rank_offset)
     x[:, -128:] = torch.arange(num_tokens, device='cuda').to(torch.bfloat16).view(-1, 1)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    
+    # 修改，scores只有我自己这个GPU上的experts，和除了我自己这个机器（一个机器上8张GPU）上的experts有值，其余的都是0
+    # Calculate machine and GPU indices
+    gpus_per_machine = 8
+    current_machine_id = rank // gpus_per_machine
+    current_gpu_local_id = rank % gpus_per_machine
+    
+    # Calculate expert ranges
+    experts_per_gpu = num_experts // num_ranks
+    
+    # 1. Set scores for local experts (this GPU)
+    local_start = rank * experts_per_gpu
+    local_end = (rank + 1) * experts_per_gpu
+    scores[:, local_start:local_end] = torch.randn(
+        (num_tokens, experts_per_gpu), 
+        dtype=torch.float32, 
+        device='cuda'
+    ).abs() + 1
+    
+    # 2. Set scores for experts on other machines (excluding current machine)
+    for gpu_id in range(num_ranks):
+        machine_id = gpu_id // gpus_per_machine
+        if machine_id != current_machine_id:  # Only for other machines
+            start_idx = gpu_id * experts_per_gpu
+            end_idx = (gpu_id + 1) * experts_per_gpu
+            scores[:, start_idx:end_idx] = torch.randn(
+                (num_tokens, experts_per_gpu), 
+                dtype=torch.float32, 
+                device='cuda'
+            ).abs() + 1
+    
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
 
@@ -139,7 +170,8 @@ def test_loop(local_rank: int, num_local_ranks: int):
     # rank is the rank of this GPU in all GPUs on all servers
     # num_ranks: the count of total GPUs
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 144
+    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
+    print("num_tokens, hidden, num_ranks, num_experts", num_tokens, hidden, num_ranks, num_experts)
 
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:

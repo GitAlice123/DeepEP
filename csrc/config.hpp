@@ -115,8 +115,14 @@ struct LowLatencyLayout {
     }
 
     LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+        // num_max_dispatch_tokens_per_rank = 128
+        // hidden = 7168
+        // num_ranks = 16
+        // num_experts = 16*16 = 256
         const int num_scales = hidden / 128;
+        // num_scales = 56
         const int num_local_experts = num_experts / num_ranks;
+        // num_local_experts = 16
 
         // Dispatch and combine layout:
         //  - 2 symmetric odd/even send buffer
@@ -126,30 +132,45 @@ struct LowLatencyLayout {
         // Message sizes
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
         size_t num_bytes_per_dispatch_msg = hidden + num_scales * sizeof(float) + sizeof(int4);
+        // num_bytes_per_dispatch_msg = 7168 + 56 * 4 + 16 = 7168 + 224 + 16 = 7408
         size_t num_bytes_per_combine_msg = sizeof(int4) + hidden * sizeof(nv_bfloat16);
+        // num_bytes_per_combine_msg = 16 + 7168 * 2 = 14352
 
         // Send buffer
         size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
+        // dispatch_send_buffer_bytes = 128 * 7408 = 984224
         size_t combine_send_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
+        // combine_send_buffer_bytes = 256 * 128 * 14352 = 470286336
         size_t send_buffer_bytes = std::max(dispatch_send_buffer_bytes, combine_send_buffer_bytes);
+        // send_buffer_bytes = 470286336
         EP_HOST_ASSERT(send_buffer_bytes % sizeof(int4) == 0);
         total_bytes += send_buffer_bytes * 2;
+        // total_bytes = 470286336 * 2 = 940572672
 
         // Symmetric receive buffers
         // TODO: optimize memory usages
         size_t dispatch_recv_data_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
+        // dispatch_recv_data_buffer_bytes = 256 * 128 * 7408 = 242745344
         size_t combine_recv_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
+        // combine_recv_buffer_bytes = 256 * 128 * 14352 = 470286336
         size_t recv_buffer_bytes = std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
+        // recv_buffer_bytes = 470286336
         EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
         total_bytes += recv_buffer_bytes * 2;
+        // total_bytes = 940572672 + 470286336 * 2 = 1880141344
 
         // Symmetric signaling buffers
         size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
+        // dispatch_recv_count_buffer_bytes = 256 * 4 = 1024
         size_t dispatch_recv_atomic_token_counter_bytes = num_local_experts * sizeof(int);
+        // dispatch_recv_atomic_token_counter_bytes = 16 * 4 = 64
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
+        // combine_recv_flag_buffer_bytes = 1024
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes + dispatch_recv_atomic_token_counter_bytes,
                                                  combine_recv_flag_buffer_bytes);
+        // signaling_buffer_bytes = max(1024 + 64, 1024) = 1088
         total_bytes += signaling_buffer_bytes * 2;
+        // total_bytes = 1880141344 + 1088 * 2 = 1880143520
 
         // Assign pointers
         // NOTES: we still leave some space for distinguishing dispatch/combine buffer,

@@ -2,6 +2,7 @@
 #include "exception.cuh"
 #include "launch.cuh"
 #include "ibgda_device.cuh"
+#include <stdio.h>
 
 namespace deep_ep {
 
@@ -180,13 +181,21 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                      dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      slot_idx * num_bytes_per_msg;
-                if (dst_rank != rank) {
+                                    //  TODO
+                if (dst_rank/8 != rank/8) {
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                 } else {
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    // UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    nvshmem_putmem(
+                        reinterpret_cast<void*>(dst_int4_ptr), 
+                        reinterpret_cast<const void*>(src_int4_ptr), 
+                        num_int4_per_msg * sizeof(int4), 
+                        dst_rank
+                    );
+                    printf("[line %d] nvshmem_putmem over\n", __LINE__);
                 }
 
                 // Increase counter after finishing
@@ -254,13 +263,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
         // Wait local sends issued and send expert counts
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
-        if (dst_rank != rank) {
+        // TODO
+        if (dst_rank/8 != rank/8) {
             nvshmemi_ibgda_rma_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1,
                                  dst_rank, dst_expert_local_idx, 0);
             // 保证接收端有足够的空间接收
             nvshmemi_ibgda_prepare_recvs(dst_rank, dst_expert_local_idx);
         } else {
-            st_na_release(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
+            // st_na_release(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
+            nvshmem_int_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+            printf("[line %d] nvshmem_int_p over\n", __LINE__);
         }
 
         // Clean workspace for next use
@@ -307,12 +319,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
-            if (src_rank != rank) {
+            // TODO
+            if (src_rank/8 != rank/8) {
                 nvshmemi_ibgda_poll_recv(src_rank, local_expert_idx);
                 num_recv_tokens = ld_acquire_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank);
                 EP_DEVICE_ASSERT(num_recv_tokens != 0);
             } else {
                 while ((num_recv_tokens = ld_acquire_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) == 0);
+                printf("[line %d] num_recv_tokens: %d\n", __LINE__, num_recv_tokens);
             }
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(atomic_counter_per_local_expert + local_expert_idx, num_recv_tokens);
@@ -331,7 +345,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
             const auto src = reinterpret_cast<int4*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
             const auto dst = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
-            UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst, src, ld_nc_global, st_na_global);
+            // UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst, src, ld_nc_global, st_na_global);
+            nvshmem_getmem(
+                reinterpret_cast<void*>(dst), 
+                reinterpret_cast<const void*>(src), 
+                hidden_int4 * sizeof(int4), 
+                src_rank
+            );
 
             // Copy scales
             const auto src_scales = reinterpret_cast<float*>(rdma_recv_x_uint8 + i * num_bytes_per_msg + kHidden);
@@ -339,13 +359,34 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             const auto scale_stride = num_ranks * num_max_dispatch_tokens_per_rank;
             auto scale_0 = lane_id < num_scales ? ld_nc_global(src_scales + lane_id) : 0;
             auto scale_1 = (lane_id + 32) < num_scales ? ld_nc_global(src_scales + lane_id + 32) : 0;
+            // 修改后的代码
+            nvshmem_getmem(
+                reinterpret_cast<void*>(dst_scales + lane_id * scale_stride), 
+                reinterpret_cast<const void*>(src_scales + lane_id), 
+                sizeof(float), 
+                src_rank
+            );
+            nvshmem_getmem(
+                reinterpret_cast<void*>(dst_scales + (lane_id + 32) * scale_stride), 
+                reinterpret_cast<const void*>(src_scales + lane_id + 32), 
+                sizeof(float), 
+                src_rank
+            );
             lane_id < num_scales ? dst_scales[lane_id * scale_stride] = scale_0 : 0.0f;
             (lane_id + 32) < num_scales ? dst_scales[(lane_id + 32) * scale_stride] = scale_1 : 0.0f;
 
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(src_scales + num_scales);
-            if (lane_id == 0)
-                recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
+            if (lane_id == 0){
+                int src_idx;
+                nvshmem_getmem(
+                    reinterpret_cast<void*>(&src_idx), 
+                    reinterpret_cast<const void*>(src_src_idx), 
+                    sizeof(int), 
+                    src_rank
+                );
+                recv_src_info[recv_token_begin_idx + i] = src_idx;
+            }
             __syncwarp();
         }
     }
@@ -468,9 +509,17 @@ combine(void* combined_x,
             auto src_idx = __ldg(local_src_info + token_idx);
             const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot + sizeof(int4);
-            if (dst_rank == rank) {
+            // TODO
+            if (dst_rank/8 == rank/8) {
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
-                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                // UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                nvshmem_putmem(
+                    reinterpret_cast<void*>(dst_int4_ptr), 
+                    reinterpret_cast<const void*>(src_int4_ptr), 
+                    hidden_bf16_int4 * sizeof(int4), 
+                    dst_rank
+                );
+                printf("[line %d] nvshmem_putmem over\n", __LINE__);
             } else {
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
@@ -483,10 +532,13 @@ combine(void* combined_x,
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0);
-            if (dst_rank != rank) {
+            // TODO
+            if (dst_rank/8 != rank/8) {
                 nvshmemi_ibgda_rma_p(rdma_recv_flag + global_expert_idx, 1, dst_rank, local_expert_idx, 0);
             } else {
-                st_na_release(rdma_recv_flag + global_expert_idx, 1);
+                // st_na_release(rdma_recv_flag + global_expert_idx, 1);
+                nvshmem_int_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                printf("[line %d] nvshmem_int_p over\n", __LINE__);
             }
             atomic_add_release_global(atomic_clean_flag, -1);
         }
@@ -505,7 +557,7 @@ combine(void* combined_x,
             // TODO: refactor QP indices
             auto src_rank = responsible_expert_idx / num_local_experts;
             auto src_expert_idx = responsible_expert_idx % num_local_experts;
-            if (src_rank != rank) {
+            if (src_rank/8 != rank/8) {
                 nvshmemi_ibgda_poll_recv(src_rank, src_expert_idx);
             } else {
                 while (ld_acquire_global(rdma_recv_flag + responsible_expert_idx) == 0);

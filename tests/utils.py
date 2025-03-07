@@ -12,10 +12,14 @@ def init_dist(local_rank: int, num_local_ranks: int):
     # Using IP and port to know who is the master node
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
+    # num of servers
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
+    # the rank of this server
     node_rank = int(os.getenv('RANK', 0))
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
+    # world_size: the count of total GPUs
+    # rank: the GPU rank on this server
     dist.init_process_group(
         backend='nccl',
         init_method=f'tcp://{ip}:{port}',
