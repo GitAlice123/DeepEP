@@ -52,7 +52,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto sm_id = static_cast<int>(blockIdx.x);
     // thread_id是在块内（SM内）的索引
     const auto thread_id = static_cast<int>(threadIdx.x);
-    // warp_id是在块内（SM内）的索引
+    // warp_id是在块内（SM内）的索引，lane_id是该线程在warp内的索引
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
     // SM的数量
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -69,12 +69,15 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
     constexpr float kFP8Margin = 1e-4, kFP8Amax = 448, kFP8AmaxInv = 1.0f / 448.0f;
+    // Every 128 elements become a group(channel), each group has a scale factor, num_scales is the count of scale factors
     const int num_scales = kHidden / kNumPerChannels;
     const size_t hidden_int4 = kHidden / sizeof(int4);
 
     // Message package: hidden data, FP8 scales, index at source
+    //TODO：这到底是什么index
     // NOTES: currently we have 3 reserved int fields for future use
     const size_t num_bytes_per_msg = kHidden + num_scales * sizeof(float) + sizeof(int4);
+    // int4: 4 int, 16 bytes
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
@@ -91,6 +94,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // 2. The last warp for reading `topk_idx` and count for per-expert information（处理topk_idx路由决策和专家计数）
     // topk_idx:数组，存储每个 Token 的 Top-K 专家索引
     if (warp_id < num_warps - 1) {
+        // kNumElemsPerRead:每次读取的元素数量，每个元素是nv_bfloat16（2B）类型，由于按照int4（16B）读取，所以每次读取8个nv_bfloat16
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
@@ -101,8 +105,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         //​示例：若 num_sms=4，则 SM 0 处理 token 0,4,8,...，SM 1 处理 token 1,5,9,...，依此类推。
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
+            // uint8_t：8位无符号整数，1字节
+            // 数据部分
             const auto rdma_x_int2 = reinterpret_cast<int2*>(reinterpret_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
+            // scales部分
             const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_int2) + kHidden);
+            // index部分
             const auto rdma_x_src_idx = reinterpret_cast<int*>(rdma_x_scales + num_scales);
 
             // num_topk:每个 Token 的 Top-K 专家数量（比如K=3）
@@ -184,18 +192,20 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                     //  TODO
                 if (dst_rank/8 != rank/8) {
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
-                } else {
+                } else if(dst_rank==rank){
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
-                    // UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-                    nvshmem_putmem(
-                        reinterpret_cast<void*>(dst_int4_ptr), 
-                        reinterpret_cast<const void*>(src_int4_ptr), 
-                        num_int4_per_msg * sizeof(int4), 
-                        dst_rank
-                    );
-                    printf("[line %d] nvshmem_putmem over\n", __LINE__);
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    // nvshmem_putmem(
+                    //     reinterpret_cast<void*>(dst_int4_ptr), 
+                    //     reinterpret_cast<const void*>(src_int4_ptr), 
+                    //     num_int4_per_msg * sizeof(int4), 
+                    //     dst_rank
+                    // );
+                    // printf("[line %d] nvshmem_putmem over\n", __LINE__);
+                }else{
+                    // TODO:nvshmem传输
                 }
 
                 // Increase counter after finishing
@@ -407,6 +417,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+    // num_experts：144
+    // num_sms：48
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
     EP_HOST_ASSERT(cell_div(static_cast<int>(hidden * 2 / sizeof(int4)), 32 * (num_warps - 1)) <= 2);

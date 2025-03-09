@@ -19,6 +19,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     rank_offset = 128
     assert num_ranks - rank_offset < 257, 'Too many ranks (exceeding test precision limit)'
 
+    # 每个token维度都是hidden，每个元素是一个bfloat16（2字节）
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * (rank - rank_offset)
     x[:, -128:] = torch.arange(num_tokens, device='cuda').to(torch.bfloat16).view(-1, 1)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
